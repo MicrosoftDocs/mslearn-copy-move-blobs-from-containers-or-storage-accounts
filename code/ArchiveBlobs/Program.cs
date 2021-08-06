@@ -1,8 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
+
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Azure.Storage.Sas;
 
 namespace ArchiveBlobs
 {
@@ -14,71 +19,79 @@ namespace ArchiveBlobs
             string sourceContainer = args[1];
             string destConnection = args[2];
             string destContainer = args[3];
-            DateTime transferBlobsNotModifiedSince = DateTime.Parse(args[4]);
-            Console.WriteLine($"Moving blobs not modified since {transferBlobsNotModifiedSince}");
+            DateTimeOffset transferBlobsModifiedSince = DateTimeOffset.Parse(args[4]);
+            Console.WriteLine($"Moving blobs modified since {transferBlobsModifiedSince}");
 
             // Connect to Azure Storage
-            CloudStorageAccount sourceAccount = CloudStorageAccount.Parse(sourceConnection);
-            CloudStorageAccount destAccount = CloudStorageAccount.Parse(destConnection);
-            CloudBlobClient sourceClient = sourceAccount.CreateCloudBlobClient();
-            CloudBlobClient destClient = destAccount.CreateCloudBlobClient();
-            CloudBlobContainer sourceBlobContainer = sourceClient.GetContainerReference(sourceContainer);
+            BlobServiceClient sourceClient = new BlobServiceClient(sourceConnection);
+            BlobServiceClient destClient = new BlobServiceClient(destConnection);
 
-            // Find all blobs that haven't changed since the specified date and time
-            IEnumerable<ICloudBlob> sourceBlobRefs = FindMatchingBlobsAsync(sourceBlobContainer, transferBlobsNotModifiedSince).Result;
+            BlobContainerClient sourceBlobContainer = sourceClient.GetBlobContainerClient(sourceContainer);
+            sourceBlobContainer.CreateIfNotExists();
+
+            // Find all blobs that have been changed since the specified date and time
+            IEnumerable<BlobClient> sourceBlobRefs = FindMatchingBlobsAsync(sourceBlobContainer, transferBlobsModifiedSince).Result;
 
             // Move matching blobs to the destination container
-            CloudBlobContainer destBlobContainer = destClient.GetContainerReference(destContainer);
+            BlobContainerClient destBlobContainer = destClient.GetBlobContainerClient(destContainer);
+            destBlobContainer.CreateIfNotExists();
+
             MoveMatchingBlobsAsync(sourceBlobRefs, sourceBlobContainer, destBlobContainer).Wait();
 
             Console.WriteLine("\nDone");
         }
 
-        // Find all blobs that haven't been modified since the specified date and time
-        private static async Task<IEnumerable<ICloudBlob>> FindMatchingBlobsAsync(CloudBlobContainer blobContainer, DateTime transferBlobsNotModifiedSince)
+        // Find all blobs that have been modified since the specified date and time
+        private static async Task<IEnumerable<BlobClient>> FindMatchingBlobsAsync(BlobContainerClient blobContainer, DateTimeOffset transferBlobsModifiedSince)
         {
-            List<ICloudBlob> blobList = new List<ICloudBlob>();
-            BlobContinuationToken token = null;
+            List<BlobClient> blobList = new List<BlobClient>();
 
             // Iterate through the blobs in the source container
-            do
+            List<BlobItem> segment = await blobContainer.GetBlobsAsync(prefix: "").ToListAsync();
+            foreach (BlobItem blobItem in segment)
             {
-                BlobResultSegment segment = await blobContainer.ListBlobsSegmentedAsync(prefix: "", currentToken: token);
-                foreach (CloudBlockBlob blobItem in segment.Results)
-                {
-                    ICloudBlob blob = await blobContainer.GetBlobReferenceFromServerAsync(blobItem.Name);
+                BlobClient blob = blobContainer.GetBlobClient(blobItem.Name);
 
-                    // Check the last modified date and time
-                    // Add the blob to the list if has not been modified since the specified date and time
-                    if (DateTime.Compare(blob.Properties.LastModified.Value.UtcDateTime, transferBlobsNotModifiedSince) <= 0)
-                    {
-                        blobList.Add(blob);
-                    }
+                // Check the source file's metadata
+                Response<BlobProperties> propertiesResponse = await blob.GetPropertiesAsync();
+                BlobProperties properties = propertiesResponse.Value;
+                
+                // Check the last modified date and time
+                // Add the blob to the list if has been modified since the specified date and time
+                if (DateTimeOffset.Compare(properties.LastModified.ToUniversalTime(), transferBlobsModifiedSince.ToUniversalTime()) > 0)
+                {
+                    blobList.Add(blob);
                 }
-            } while (token != null);
+            }
 
             // Return the list of blobs to be transferred
             return blobList;
         }
 
         // Iterate through the list of source blobs, and transfer them to the destination container
-        private static async Task MoveMatchingBlobsAsync(IEnumerable<ICloudBlob> sourceBlobRefs, CloudBlobContainer sourceContainer, CloudBlobContainer destContainer)
+        private static async Task MoveMatchingBlobsAsync(IEnumerable<BlobClient> sourceBlobRefs, BlobContainerClient sourceContainer, BlobContainerClient destContainer)
         {
-            foreach (ICloudBlob sourceBlobRef in sourceBlobRefs)
+            foreach (BlobClient sourceBlobRef in sourceBlobRefs)
             {
                 // Copy the source blob
-                CloudBlockBlob destBlob = destContainer.GetBlockBlobReference(sourceBlobRef.Name);
+                BlobClient sourceBlob = sourceContainer.GetBlobClient(sourceBlobRef.Name);
 
-                await destBlob.StartCopyAsync(new Uri(GetSharedAccessUri(sourceBlobRef.Name, sourceContainer)));
+                // Check the source file's metadata
+                Response<BlobProperties> propertiesResponse = await sourceBlob.GetPropertiesAsync();
+                BlobProperties properties = propertiesResponse.Value;
+
+                BlobClient destBlob = destContainer.GetBlobClient(sourceBlobRef.Name);
+                CopyFromUriOperation ops = await destBlob.StartCopyFromUriAsync(GetSharedAccessUri(sourceBlobRef.Name, sourceContainer));
 
                 // Display the status of the blob as it is copied
-                ICloudBlob destBlobRef = await destContainer.GetBlobReferenceFromServerAsync(sourceBlobRef.Name);
-                while (destBlobRef.CopyState.Status == CopyStatus.Pending)
+                while(ops.HasCompleted == false)
                 {
-                    Console.WriteLine($"Blob: {destBlobRef.Name}, Copied: {destBlobRef.CopyState.BytesCopied ?? 0} of  {destBlobRef.CopyState.TotalBytes ?? 0}");
+                    long copied = await ops.WaitForCompletionAsync();
+
+                    Console.WriteLine($"Blob: {destBlob.Name}, Copied: {copied} of {properties.ContentLength}");
                     await Task.Delay(500);
-                    destBlobRef = await destContainer.GetBlobReferenceFromServerAsync(sourceBlobRef.Name);
                 }
+
                 Console.WriteLine($"Blob: {destBlob.Name} Complete");
 
                 // Remove the source blob
@@ -86,22 +99,15 @@ namespace ArchiveBlobs
             }
         }
 
-        // Create a SAS token for the source blob, to enable it to be read by the StartCopyAsync method
-        private static string GetSharedAccessUri(string blobName, CloudBlobContainer container)
+        // Create a SAS token for the source blob, to enable it to be read by the StartCopyFromUriAsync method
+        private static Uri GetSharedAccessUri(string blobName, BlobContainerClient container)
         {
-            DateTime toDateTime = DateTime.Now.AddMinutes(60);
+            DateTimeOffset expiredOn = DateTimeOffset.UtcNow.AddMinutes(60);
 
-            SharedAccessBlobPolicy policy = new SharedAccessBlobPolicy
-            {
-                Permissions = SharedAccessBlobPermissions.Read,
-                SharedAccessStartTime = null,
-                SharedAccessExpiryTime = new DateTimeOffset(toDateTime)
-            };
+            BlobClient blob = container.GetBlobClient(blobName);
+            Uri sasUri = blob.GenerateSasUri(BlobSasPermissions.Read, expiredOn);
 
-            CloudBlockBlob blob = container.GetBlockBlobReference(blobName);
-            string sas = blob.GetSharedAccessSignature(policy);
-
-            return blob.Uri.AbsoluteUri + sas;
+            return sasUri;
         }
     }
 }
