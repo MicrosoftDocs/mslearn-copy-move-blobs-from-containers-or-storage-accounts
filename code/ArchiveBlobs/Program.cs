@@ -29,13 +29,13 @@ namespace ArchiveBlobs
             BlobContainerClient sourceBlobContainer = sourceClient.GetBlobContainerClient(sourceContainer);
             sourceBlobContainer.CreateIfNotExists();
 
+            BlobContainerClient destBlobContainer = destClient.GetBlobContainerClient(destContainer);
+            destBlobContainer.CreateIfNotExists();
+
             // Find all blobs that have been changed since the specified date and time
             IEnumerable<BlobClient> sourceBlobRefs = FindMatchingBlobsAsync(sourceBlobContainer, transferBlobsModifiedSince).Result;
 
             // Move matching blobs to the destination container
-            BlobContainerClient destBlobContainer = destClient.GetBlobContainerClient(destContainer);
-            destBlobContainer.CreateIfNotExists();
-
             MoveMatchingBlobsAsync(sourceBlobRefs, sourceBlobContainer, destBlobContainer).Wait();
 
             Console.WriteLine("\nDone");
