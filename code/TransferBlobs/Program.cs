@@ -13,7 +13,7 @@ namespace TransferBlobs
 {
     class Program
     {
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             string sourceConnection = args[0];
             string sourceContainer = args[1];
@@ -33,10 +33,10 @@ namespace TransferBlobs
             destBlobContainer.CreateIfNotExists();
 
             // Find all blobs that have been changed since the specified date and time
-            IEnumerable<BlobClient> sourceBlobRefs = FindMatchingBlobsAsync(sourceBlobContainer, transferBlobsModifiedSince).Result;
+            IEnumerable<BlobClient> sourceBlobRefs = await FindMatchingBlobsAsync(sourceBlobContainer, transferBlobsModifiedSince);
 
             // Move matching blobs to the destination container
-            MoveMatchingBlobsAsync(sourceBlobRefs, sourceBlobContainer, destBlobContainer).Wait();
+            await MoveMatchingBlobsAsync(sourceBlobRefs, sourceBlobContainer, destBlobContainer);
 
             Console.WriteLine("\nDone");
         }
