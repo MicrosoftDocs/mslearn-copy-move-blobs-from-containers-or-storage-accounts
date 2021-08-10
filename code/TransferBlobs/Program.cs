@@ -9,7 +9,7 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
 
-namespace ArchiveBlobs
+namespace TransferBlobs
 {
     class Program
     {
